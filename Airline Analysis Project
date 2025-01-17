@@ -1,0 +1,1051 @@
+#Necessary imports
+import pandas as pd
+import numpy as np
+from sklearn.impute import SimpleImputer
+import seaborn as sns
+import matplotlib.pyplot as plt
+import os
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import TimeSeriesSplit
+from scipy.optimize import minimize
+from sklearn.metrics import r2_score
+from statsmodels.tsa.stattools import adfuller
+from sklearn.metrics import mean_squared_error
+
+
+
+class AirlineDataProcessor:
+    """
+    A class to process and combine all the datasets needed for the analysis
+    """
+    
+    def __init__(self):
+        """ Initialize with target airlines and time periods """
+        
+        self.airlines = ['UA', 'AA']
+        self.years = [2021, 2022, 2023]
+        self.quarters = [1, 2, 3, 4] 
+
+    def process_sustainability_reports(self, sustainability_file):
+        """"
+        Process sustainability report
+        
+         Args:
+            sustainability_file (str): Path to the sustainability report CSV file
+        
+        Returns:
+            pandas.DataFrame: Processed sustainability metrics or None if processing fails
+        """
+        print('\nProcessing Sustainability Report...')
+
+        try:
+            if not os.path.exists(sustainability_file):
+                print(f"Sustainability report not found: {sustainability_file}")
+                return None
+
+            sus_df = pd.read_csv('Sustainability Report.csv')
+
+            #filter for relevant airlines and years
+            sus_df = sus_df[
+                (sus_df['Airline'].isin(self.airlines))&
+                (sus_df['Year'].isin(self.years))]
+
+            #calculate key metrics
+            metrics = sus_df.groupby(['Airline', 'Year']).agg({
+                'CO2_Emissions': 'sum',
+                'Fuel_Consumption': 'sum',
+                'Revenue_Passenger_Miles': 'sum',
+                'Available_Seat_Miles': 'sum'
+            }).reset_index()
+
+            metrics['Emissions_Per_RPM'] = (metrics['CO2_Emissions'] / metrics['Revenue_Passenger_Miles'])
+            metrics['Fuel_Efficiency'] = (metrics['Revenue_Passenger_Miles'] / metrics['Fuel_Consumption'])
+
+            return metrics
+            
+        except Exception as e:
+            print(f"Error calculating sustainability metrics: {e}")
+            return None
+            
+    def process_db1b_data(self, market_dir, ticket_dir):
+        """
+        Process DB1B Market and Ticket Data for all quarters and years
+        
+         Args:
+            market_dir (str): Directory containing DB1B Market data files
+            ticket_dir (str): Directory containing DB1B Ticket data files
+        
+        Returns:
+            pandas.DataFrame: Combined DB1B data or raises exception if processing fails
+        
+        """
+        print("Processing DB1B data...")
+
+        all_data = []
+
+        #Process data year by year
+        for year in self.years:
+            print(f"\nProcessing year {year}...")
+
+            year_data = []
+
+            # Process each quarter's data
+            for quarter in self.quarters:
+                print(f"Processing Q{quarter}...")
+
+                try:
+
+                    #load DB1B ticket data
+                    ticket_file = f"{ticket_dir}/DB1B_Ticket_{year}_Q{quarter}.csv"
+                    ticket_df = pd.read_csv(ticket_file)
+                    ticket_df = ticket_df.rename(columns={ticket_df.columns[17]: 'Carrier'})
+                    ticket_df['Carrier'].str.strip()
+                    print(f"Loaded ticket data: {ticket_file}")                   
+
+                    #load DB1B market data
+                    market_file = f"{market_dir}/DB1B_Market_{year}_Q{quarter}.csv"
+                    market_df = pd.read_csv(market_file)
+                    print(f"Loaded market data: {market_file}")
+
+                    #Merge ticket and market data
+                    quarter_data = self.merge_market_ticket(market_df, ticket_df)
+
+                    #filter out relevant airlines
+                    quarter_data = quarter_data[
+                        quarter_data['Carrier'].isin(self.airlines)
+                    ]
+
+                    # Add time period identifiers
+                    quarter_data['Year'] = year
+                    quarter_data['Quarter'] = quarter
+
+                    year_data.append(quarter_data)
+                
+                except FileNotFoundError as e:
+                    print(f"Error: Could not find file - {e}")
+                except Exception as e:
+                    print(f"Error processing data for {year} Q{quarter}: {e}")
+
+            # Combine all quarters for the current year
+            if year_data:  
+                year_combined = pd.concat(year_data, ignore_index=True)
+                all_data.append(year_combined)
+
+        # Combine all years of data
+        if all_data:  
+            final_db1b = pd.concat(all_data, ignore_index=True)
+            return final_db1b
+        else:
+            raise Exception("No data was processed successfully")
+
+    def merge_market_ticket(self, market_df, ticket_df):
+        """
+        Merge market and ticket data for a single quarter
+        
+        Args:
+        market_df 
+        ticket_df
+    
+        Returns:
+        pandas.DataFrame: Merged dataset containing selected columns from both sources
+        
+        """
+        market_cols = [
+            'ItinID', 'Origin', 'Dest', 'MktFare', 'MktDistance'
+        ]
+        
+        ticket_cols = [
+            'ItinID', 'Passengers', 'ItinFare', 'RoundTrip', 'Carrier'
+        ]
+
+        market_df = market_df[market_cols]
+        ticket_df = ticket_df[ticket_cols]
+
+        merged = pd.merge(
+            market_df,
+            ticket_df,
+            on='ItinID',
+            how='inner'
+        )
+        return merged
+
+    def process_form41_data(self, schedule_B1_dir, schedule_P12_dir):
+        """
+        Process Schedule B1 and Schedule P12 Data for all years
+
+        Args:
+        schedule_B1_dir (str): Directory of schedule B1 files (Balance Sheet) 
+        schedule_P12_dir: (str): Directory of schedule P12 files (Profit & Loss)
+    
+        Returns:
+        pandas.DataFrame: Combined financial data and metrics
+        
+        """
+        print("Processing Form 41 data...")
+
+        metrics_list = []
+
+        for year in self.years:
+            print(f"\nProcessing year {year}...")
+
+            try:
+                    #load schedule B1 data
+                    schedule_B1_file = f"{schedule_B1_dir}/Schedule_B1_{year}.csv" 
+                    schedule_B1_df = pd.read_csv(schedule_B1_file)
+                    print(f"Loaded schedule B1 data: {schedule_B1_file}")                   
+
+                    #Load schedule P12 data
+                    schedule_P12_file = f"{schedule_P12_dir}/Schedule_P12_{year}.csv"
+                    schedule_P12_df = pd.read_csv(schedule_P12_file)
+                    print(f"Loaded schedule P12 data: {schedule_P12_file}")
+
+                    #merge B1 and P12 data
+                    year_data = self.merge_B1_P12(schedule_B1_df, schedule_P12_df)
+                    year_data = year_data[year_data['UNIQUE_CARRIER'].isin(self.airlines)]
+                    year_data['YEAR'] = year
+
+                    #Calculate financial metrics for the year
+                    year_metrics= self.process_form41_metrics(year_data)
+                    if year_metrics is not None:
+                        metrics_list.append(year_metrics)
+            
+            except Exception as e:
+                print(f"Error processing data for {year}: {e}")
+                
+        #combine all years metrics
+        if metrics_list:
+            return pd.concat(metrics_list, ignore_index=True)
+        else:
+            raise Exception("No data was processed successfully")
+
+    def merge_B1_P12(self, schedule_B1_df, schedule_P12_df):
+        """
+        Selects Specific colums from Schedule B1 and P12 and merges them 
+        
+        """
+       
+        B1_cols = [
+            'UNIQUE_CARRIER', 'ASSETS', 'CURR_LIABILITIES', 'NON_REC_LIAB']
+        
+        P12_cols = [
+            'UNIQUE_CARRIER', 'OP_EXPENSES', 'OP_REVENUES', 'NET_INCOME']
+
+        schedule_B1_df = schedule_B1_df[B1_cols]
+        schedule_P12_df = schedule_P12_df[P12_cols]
+
+        form41_merged = pd.merge(
+            schedule_B1_df,
+            schedule_P12_df,
+            on='UNIQUE_CARRIER',
+            how='inner'
+        )
+        return form41_merged
+
+    def process_form41_metrics(self, form41_df):
+        """
+        Calculate key financial metrics from Form 41 data
+        """
+        try:
+          
+            #Aggregate financial metrics by carrier and year
+            metrics = form41_df.groupby(['UNIQUE_CARRIER', 'YEAR']).agg({
+            'OP_REVENUES': 'sum',
+            'OP_EXPENSES': 'sum',
+            'NET_INCOME': 'sum',
+            'ASSETS': 'mean',
+            'CURR_LIABILITIES': 'mean',
+            'NON_REC_LIAB': 'mean'
+            }).reset_index()
+            
+            # Calculate derived financial metrics
+            metrics['Total_Liabilities'] = (metrics['NON_REC_LIAB'] + metrics['NON_REC_LIAB'])
+            metrics['Operating_Margin'] = (metrics['OP_REVENUES'] - metrics['OP_EXPENSES']) / metrics['OP_REVENUES']
+            
+            metrics['Debt_to_Asset_Ratio'] = (metrics['Total_Liabilities'] / metrics['ASSETS'])
+                        
+            return metrics
+            
+        except Exception as e:
+            print(f"Error calculating Form 41 metrics: {e}")
+            return None
+
+    def process_t100_data(self, t100_files):
+        """
+        Process T100 data for multiple years
+        Args:
+        t100_files (list): List of file paths to T100 data files
+    
+        Returns:
+        pandas.DataFrame: Processed T100 data with calculated metrics
+        
+        """
+        print("Processing T100 data...")
+
+        all_t100_data = []
+
+        #process each T100 file
+        for file in t100_files:
+            try:
+
+                #laod T100 data
+                t100 = pd.read_csv(file)
+                print(f"Loaded T100 file: {file}")
+
+                #filter out relevant Airlines and years
+                t100_filtered = t100[
+                    (t100['UNIQUE_CARRIER'].isin(self.airlines)) &
+                    (t100['YEAR'].isin(self.years))
+                ]
+
+                all_t100_data.append(t100_filtered)  
+            except Exception as e:
+                print(f"Error processing T100 file {file}: {e}")
+
+        if all_t100_data:
+            #combine all T100 data
+            t100_combined = pd.concat(all_t100_data, ignore_index=True)
+
+            #calculate metrics by carrier, route and year
+            t100_processed = t100_combined.groupby(
+                ['UNIQUE_CARRIER', 'DEST', 'ORIGIN', 'MONTH', 'YEAR']
+            ).agg({
+                'PASSENGERS': 'sum',
+                'SEATS': 'sum',
+                'DISTANCE': 'first',
+                'DEPARTURES_PERFORMED': 'sum'
+            }).reset_index()
+
+            #calculate load factor
+            t100_processed['Load_Factor'] = t100_processed['PASSENGERS'] / t100_processed['SEATS']
+
+            return t100_processed
+        else:
+            raise Exception("No T100 data was processed successfully")
+
+    def combine_all_data(self, sustainability_data, db1b_data, form41_data, t100_data):
+        """
+        Combine all datasets for comprehensive analysis
+
+        Args:
+        sustainability_data (pandas.DataFrame): Environmental metrics data
+        db1b_data (pandas.DataFrame): Ticket and market data
+        form41_data (pandas.DataFrame): Financial data
+        t100_data (pandas.DataFrame): Traffic statistics data
+    
+        Returns:
+        pandas.DataFrame: Combined dataset
+        
+        """
+        print("\nCombining all datasets...")
+
+        try:
+            #Rename relevant columns to maintain consistency
+            t100_data = t100_data.rename(columns={
+                'UNIQUE_CARRIER': 'Carrier',
+                'ORIGIN': 'Origin',
+                'DEST': 'Dest',
+                'YEAR': 'Year'
+            })
+
+            form41_data = form41_data.rename(columns={ 
+                'UNIQUE_CARRIER': 'Carrier',
+                'YEAR': 'Year'
+            })
+
+            sustainability_data = sustainability_data.rename(columns={'Airline': 'Carrier'})
+
+            #Merge DB1B and T100 data 
+            combined = pd.merge(
+                db1b_data,
+                t100_data,
+                on= ['Year', 'Carrier', 'Origin', 'Dest'],
+                how= 'outer'
+            )
+
+            #Merge with sustainability data
+            combined =  pd.merge(
+                combined,
+                sustainability_data,
+                on= ['Year', 'Carrier'],
+                how= 'left'
+                
+            )
+
+            #Merge with Form41 data
+            combined = pd.merge(
+                combined,
+                form41_data,
+                on= ['Year', 'Carrier'],
+                how= 'left'
+            )
+
+            return combined
+
+        except Exception as e:
+            print(f"Error combining datasets: {e}")
+            print("Column names in db1b_data:", db1b_data.columns.tolist())
+            print("Column names in t100_data:", t100_data.columns.tolist())
+            print("Column names in sustainability_data:", sustainability_data.columns.tolist())
+            print("Column names in form41_data:", form41_data.columns.tolist())
+            return None
+
+class DataCleaner: 
+    """
+    A class for cleaning and preprocessing the combined airline dataset.
+  
+    """
+    
+    def __init__(self, data):
+        self.data = data
+        self.cleaned_data = None
+
+    def clean_data(self):
+                
+        """
+        Clean the combined dataset
+        - Convert data types
+        - Removing outliers
+        - Filtering invalid values
+        - Removing duplicates
+
+        Returns:
+            Cleaned dataset
+        """
+        
+        print("\nCleaning data...")
+        df = self.data.copy()
+
+        #convert data types
+        df['Year'] = df['Year'].astype(int)
+        df['Quarter'] = pd.to_numeric(df['Quarter'], errors= 'coerce')
+        df['ItinFare'] = pd.to_numeric(df['ItinFare'], errors= 'coerce')
+
+        #Remove outliers unsing interquartile range (IQR)
+        for col in ['ItinFare', 'MktDistance']:
+            Q1 = df[col].quantile(0.25)
+            Q3 = df[col].quantile(0.75)
+            IQR = Q3 - Q1
+            df = df[~((df[col] < (Q1 - 1.5 * IQR)) | (df[col] > (Q3 + 1.5 * IQR )))]
+
+        #filter out invalid values
+        df = df[df['ItinFare'] > 0.25] #fares lower than 0.25
+        df = df[df['MktDistance'] > 0] #invalid distances
+        df = df[df['Passengers'] > 0] #zero passengers
+
+        df = df.drop_duplicates()
+
+        self.cleaned_data = df
+        print("Data cleaning completed")
+        return df
+
+
+    def handle_missing_values(self):
+        """
+        Handle missing values in the dataset
+        - Use median values for numerical columns
+        - Use mode values for categorical columns
+        
+        Returns:
+            Dataset with imputed missing values
+        """
+
+        print("Handling missing values")
+        df = self.cleaned_data.copy()
+
+        #numerical columns
+        numerical_columns = df.select_dtypes(include=['float64', 'int64']).columns
+        imputer = SimpleImputer(strategy='median')
+
+        df[numerical_columns] = imputer.fit_transform(df[numerical_columns])
+
+        #categorical columns
+        categorical_columns = df.select_dtypes(include= ['object']).columns
+        for col in categorical_columns:
+            df[col] = df[col].fillna(df[col].mode()[0])
+
+        self.cleaned_data = df
+        print("Missing value handling completed")
+        return df
+
+
+class DataAnalyzer:
+    
+    """
+    A class for performing comprehensive analysis on the dataset.
+    Generates various analyses including revenue, environmental, route, and financial metrics.
+    
+    """
+    
+    def __init__(self, data):
+        self.data = data
+        
+    def generate_comprehensive_report(self):
+        """
+        Generate a comprehensive report including all metrics
+        - Revenue analysis
+        - Environmental analysis
+        - Route analysis
+        - Financial analysis
+        - Correlation analysis
+        - Various visualizations
+        
+        Returns:
+            dict: Dictionary containing different analysis results
+        
+        """
+        print("\nComprehensive Analysis Report...")
+        print("=" * 50)
+
+        try:
+            df = self.data
+
+            #Revenue Analysis
+            revenue_analysis = df.groupby(['Year', 'Carrier']).agg({
+                'ItinFare': ['mean', 'median'],
+                'Passengers': 'sum',
+                'MktDistance': 'mean',
+                'Load_Factor': 'mean',
+                'SEATS': 'sum',
+                'OP_REVENUES': 'sum',
+                'Operating_Margin': 'mean'
+            }).round(2)
+
+            #Environmental metrics
+            environmental_analysis = df.groupby(['Carrier', 'Year']).agg({
+                'CO2_Emissions': 'sum',
+                'Emissions_Per_RPM': 'mean',
+                'Fuel_Efficiency': 'mean'
+            }).round(2)
+
+            #Route Analysis
+            route_analysis = df.groupby(['Year', 'Carrier', 'Origin', 'Dest']).agg({
+                'ItinFare': 'mean',
+                'Passengers': 'sum',
+                'MktDistance': 'first'
+            }).round(2)
+                    
+            #Financial Analysis
+            financial_analysis = df.groupby(['Year', 'Carrier']).agg({
+                'Operating_Margin': 'mean',
+                'Debt_to_Asset_Ratio': 'mean'
+            }).round(2)
+
+            #Printing out analysis Tables
+            
+            print("\nSummary Statistics:")
+            print("-" * 50)
+            print(df.describe())
+        
+         
+            print("\n1. Revenue Analysis")
+            print("-" * 50)
+            print(revenue_analysis)
+            
+
+            print("\n2. Environmental Analysis")
+            print("-" * 50)
+            print(environmental_analysis)
+            
+    
+            print("\n3. Top 10 Routes by Passenger Volume")
+            print("-" * 50)
+            top_routes = route_analysis.nlargest(10, 'Passengers').reset_index()
+            print(top_routes)
+
+            print("\n4. Bottom 10 Routes by Passenger Volume")
+            print("-" * 50)
+            bottom_routes = route_analysis.nsmallest(10, 'Passengers').reset_index()
+            print(bottom_routes) 
+    
+            print("\n5. Financial Analysis")
+            print("-" * 50)
+            print(financial_analysis)
+           
+
+            #Printing out analysis Graphs/visualizations
+            
+            #Correlation Matrix
+            print("\n6. Correlation Analysis:")
+            correlation_matrix = df[['ItinFare', 'Load_Factor',
+                                    'CO2_Emissions', 'Operating_Margin']].corr()
+            plt.figure(figsize=(10,8))
+            sns.heatmap(correlation_matrix, annot=True, cmap= 'coolwarm')
+            plt.title('Correlation Matrix')
+           
+
+            plt.figure(figsize=(20, 15))
+            #Boxplot showing average fares by airlines over the years
+            plt.subplot(2, 2, 1)
+            sns.boxplot(x='Year', y='ItinFare', hue='Carrier', data=df)
+            plt.title('Average Fare Distribution by carrier and year')
+            plt.xticks(rotation=45)
+           
+
+            #Lineplot showing Load factor trends
+            plt.subplot(2, 2, 2)
+            sns.lineplot(data=df, x='Year', y='Load_Factor', hue='Carrier')
+            plt.title('Load Factor Trends by Carrier')
+          
+
+            #Barplot showing Average CO2 emissions
+            plt.subplot(2, 2, 3)
+            emissions_by_year = df.groupby(['Year', 'Carrier'])['CO2_Emissions'].mean().reset_index()
+            sns.barplot(data=emissions_by_year, x='Year', y='CO2_Emissions', hue='Carrier')
+            plt.title('Average CO2 Emissions by Carrier and Year')
+
+
+            #Lineplot showing operating margin trends
+            plt.subplot(2, 2, 4)
+            sns.lineplot(data=df, x='Year', y='Operating_Margin', hue='Carrier')
+            plt.title('Operating Margin Trends')
+
+            
+            plt.tight_layout()
+            plt.show()
+
+            # Lineplot showing Fuel Efficiency 
+            plt.figure(figsize=(20, 15))
+            plt.subplot(2, 2, 1)
+            sns.lineplot(data=df, x='Year', y='Fuel_Efficiency', hue='Carrier', marker='o')
+            plt.title('Fuel Efficiency by Carrier Over Time')
+            plt.ylabel('Fuel Efficiency (RPM/Fuel)')
+            
+            plt.tight_layout()
+            plt.show()
+
+            #Route data visualisations
+            plt.figure(figsize=(20, 15))
+            
+            #bar plot of top 10 routes
+            plt.subplot(2, 1, 1)
+            top_routes['Route'] = top_routes['Origin'] + '-' + top_routes['Dest']
+            sns.barplot(data=top_routes, 
+                        x='Passengers', 
+                        y='Route',
+                        hue='Carrier')
+            plt.title('Top 10 Routes by Passenger Volume')
+            plt.xlabel('Total Passengers')
+            plt.ylabel('Route')
+
+            #bar plot of bottom 10 routes
+            plt.subplot(2, 1, 2)
+            bottom_routes['Route'] = bottom_routes['Origin'] + '-' + bottom_routes['Dest']
+            sns.barplot(data=bottom_routes, 
+                        x='Passengers', 
+                        y='Route',
+                        hue='Carrier')
+            plt.title('Bottom 10 Routes by Passenger Volume')
+            plt.xlabel('Total Passengers')
+            plt.ylabel('Route')
+            
+            
+            plt.tight_layout()
+            plt.show()
+            
+            return {
+                'revenue_analysis': revenue_analysis,
+                'environmental_analysis': environmental_analysis,
+                'route_analysis': route_analysis,
+                'financial_analysis': financial_analysis
+            }
+        except Exception as e:
+            print(f"Error generating comprehensive report: {e}")
+            return None
+
+class TimeSeriesAnalyzer:
+    
+    """
+    A class for performing time series analysis on the airline dataset.
+    Focuses on testing stationarity of key metrics over time.
+    """
+    
+    def __init__(self, data):
+        self.data = data
+        
+    def test_stationarity(self, columns=['ItinFare', 'CO2_Emissions', 'Operating_Margin', 'Load_Factor']):
+        """
+        Perform Augmented Dickey-Fuller test on specified columns using quarterly data
+         Args:
+            columns (list): List of column names to test for stationarity
+            
+        Returns:
+            dict: Dictionary containing ADF test results for each column
+
+        """
+        results = {}
+        for column in columns:
+            # Create quarterly time series
+            ts_data = self.data.groupby(['Year', 'Quarter'])[column].mean().reset_index()
+            
+            # Convert quarters to months (Q1->1, Q2->4, Q3->7, Q4->10)
+            quarter_to_month = {1: 1, 2: 4, 3: 7, 4: 10}
+            ts_data['Month'] = ts_data['Quarter'].map(quarter_to_month)
+            
+            # Create datetime index for the time series
+            ts_data['Date'] = pd.to_datetime(ts_data.apply(
+                lambda x: f"{int(x['Year'])}-{int(x['Month'])}-01", 
+                axis=1
+            ))
+
+            # Set Date as index and ensure chronological order
+            ts_data.set_index('Date', inplace=True)
+            ts_data = ts_data.sort_index()
+            ts_series = ts_data[column]
+            
+            # Perform ADF test
+            adf_result = adfuller(ts_series.dropna(), regression='c', autolag='AIC')
+
+            #Store results
+            results[column] = {
+                'adf_statistic': adf_result[0],
+                'p_value': adf_result[1],
+                'critical_values': adf_result[4],
+                'is_stationary': adf_result[1] < 0.05
+            }
+            
+            # Print test results
+            print(f"\nADF Test Results for {column}")
+            print("================================")
+            print(f'ADF Statistic: {adf_result[0]:.4f}')
+            print(f'p-value: {adf_result[1]:.4f}')
+            print('Critical values:')
+            for key, value in adf_result[4].items():
+                print(f'\t{key}: {value:.4f}')
+        
+        return results
+
+class PriceEmissionOptimizer:
+    """
+    A class for optimizing airline pricing while considering environmental impact.
+    Uses machine learning models (Random Forest) to predict prices and emissions under different scenarios.
+    """
+    def __init__(self, data):
+        self.data = data
+        self.scaler = StandardScaler()
+        self.airlines = ['UA', 'AA']
+        self.models = {}
+        
+    def prepare_features(self):
+        """
+        Prepare features separately for each airline
+        - Grouping data by airline and quarter
+        - Creating lagged features
+        - Aggregating metrics
+        
+        Returns:
+            dict: Dictionary containing prepared data for each airline
+        """
+        prepared_data = {}
+        
+        for airline in self.airlines:
+            #filter and prepare data for each airline and year
+            df = self.data[self.data['Carrier'] == airline].copy()
+            df['YearQuarter'] = df['Year'].astype(str) + '-' + df['Quarter'].astype(str)
+
+            #Calculate quarterly aggregates
+            quarterly_data = df.groupby(['YearQuarter']).agg({
+                'ItinFare': 'mean',
+                'CO2_Emissions': 'mean',
+                'Load_Factor': 'mean',
+                'MktDistance': 'mean',
+                'Operating_Margin': 'mean'
+            }).reset_index()
+            
+            # create lagged features
+            for col in ['ItinFare', 'CO2_Emissions', 'Load_Factor']:
+                quarterly_data[f'{col}_lag1'] = quarterly_data[col].shift(1)
+
+            prepared_data[airline] = quarterly_data.dropna()
+        
+        return prepared_data
+    
+    def fit_models(self, prepared_data):
+        """
+        Fit Random Forest models for predicting prices and emissions.
+        
+        Args:
+            prepared_data (dict): Dictionary containing prepared data for each airline
+        """
+        #Define features for the models
+        features = ['MktDistance', 'Load_Factor', 'Operating_Margin',
+                   'ItinFare_lag1', 'CO2_Emissions_lag1']
+        
+        for airline in self.airlines:
+            airline_data = prepared_data[airline]
+            X = airline_data[features]
+            y_price = airline_data['ItinFare']
+            y_emissions = airline_data['CO2_Emissions']
+
+            #Train separate models for price and emissions
+            rf_price = RandomForestRegressor(n_estimators=100, random_state=42)
+            rf_emissions = RandomForestRegressor(n_estimators=100, random_state=42)
+            
+            rf_price.fit(X, y_price)
+            rf_emissions.fit(X, y_emissions)
+            
+            self.models[airline] = {
+                'price': rf_price,
+                'emissions': rf_emissions,
+                'features': features
+            }
+            
+            # analyse and print feature importances for each airline
+            price_importances = pd.DataFrame({
+                'feature': features,
+                'importance': rf_price.feature_importances_
+            }).sort_values('importance', ascending=False)
+            
+            print(f"\nFeature Importances for {airline} - Price Model:")
+            print(price_importances)
+    
+    def optimize_price_emissions(self, prepared_data):
+        """
+        Optimize prices for each airline under different scenarios'
+        
+         Scenarios:
+        - Revenue Focus: Prioritize revenue (80%) over emissions (20%)
+        - Balanced: Equal weight to revenue and emissions (50% each)
+        - Green Focus: Prioritize emissions (80%) over revenue (20%)
+        
+        Returns:
+            dict: Optimized prices and predicted emissions for each airline under each scenario
+        """
+        scenarios = {
+            'Revenue Focus': {'price': 0.8, 'emissions': 0.2},
+            'Balanced': {'price': 0.5, 'emissions': 0.5},
+            'Green Focus': {'price': 0.2, 'emissions': 0.8}
+        }
+        
+        results = {}
+        
+        for airline in self.airlines:
+            airline_data = prepared_data[airline]
+            airline_models = self.models[airline]
+            
+            # Get latest features
+            latest_features = {
+                'MktDistance': airline_data['MktDistance'].mean(),
+                'Load_Factor': airline_data['Load_Factor'].iloc[-1],
+                'Operating_Margin': airline_data['Operating_Margin'].mean(),
+                'ItinFare_lag1': airline_data['ItinFare'].mean(),
+                'CO2_Emissions_lag1': airline_data['CO2_Emissions'].mean()
+            }
+            
+            # Calculate optimal prices for each scenario
+            scenario_results = {}
+            for scenario_name, weights in scenarios.items():
+                def objective(price):
+                    """
+                    Objective function for optimization:
+                    Combines normalized revenue and emissions based on scenario weights
+                    """
+                    
+                    features_dict = latest_features.copy()
+                    features_dict['ItinFare_lag1'] = price[0]
+                    features_df = pd.DataFrame([features_dict])
+                    
+                    predicted_emissions = airline_models['emissions'].predict(features_df)[0]
+                    revenue = price[0] * features_dict['Load_Factor']
+                    
+                    # Normalize values
+                    norm_revenue = revenue / airline_data['ItinFare'].max()
+                    norm_emissions = predicted_emissions / airline_data['CO2_Emissions'].max()
+                    
+                    return weights['emissions'] * norm_emissions - weights['price'] * norm_revenue
+                
+                # Find optimal price using L-BFGS-B optimization
+                result = minimize(objective,
+                                x0=[airline_data['ItinFare'].mean()],
+                                bounds=[(airline_data['ItinFare'].min(),
+                                        airline_data['ItinFare'].max())],
+                                method='L-BFGS-B')
+                
+                # Calculate predicted emissions for optimal price
+                features_dict = latest_features.copy()
+                features_dict['ItinFare_lag1'] = result.x[0]
+                features_df = pd.DataFrame([features_dict])
+                predicted_emissions = airline_models['emissions'].predict(features_df)[0]
+                
+                scenario_results[scenario_name] = {
+                    'optimal_price': result.x[0],
+                    'predicted_emissions': predicted_emissions
+                }
+            
+            results[airline] = scenario_results
+        
+        return results
+    
+    def visualize_results(self, prepared_data, optimization_results):
+        """
+        Create visualizations for the results
+        """
+        plt.figure(figsize=(20, 15))
+        
+        # Plot 1: Price vs Emissions with Scenario Points    
+        plt.subplot(2, 2, 1)
+        colors = {'UA': 'blue', 'AA': 'red'}
+        markers = {'Revenue Focus': '^', 'Balanced': 's', 'Green Focus': 'D'}
+        
+        for airline in self.airlines:
+            data = prepared_data[airline]
+            
+            # Plot actual data points
+            plt.scatter(data['ItinFare'], data['CO2_Emissions'],
+                       label=f'{airline} Actual',
+                       color=colors[airline], alpha=0.3)
+            
+            # Plot optimal points
+            for scenario, results in optimization_results[airline].items():
+                plt.scatter(results['optimal_price'],
+                          results['predicted_emissions'],
+                          marker=markers[scenario], s=200,
+                          label=f'{airline} {scenario}',
+                          color=colors[airline])
+        
+        plt.xlabel('Itinerary Fare ($)')
+        plt.ylabel('CO2 Emissions')
+        plt.title('Price vs Emissions with Optimal Points by Scenario')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        
+        
+        # Plot 2: Price Distribution by Airline
+        plt.subplot(2, 2, 2)
+        for airline in self.airlines:
+            sns.kdeplot(data=prepared_data[airline]['ItinFare'],
+                       label=airline, fill=True, alpha=0.5)
+        plt.title('Price Distribution by Airline')
+        plt.xlabel('Itinerary Fare ($)')
+        plt.ylabel('Density')
+    
+        
+        # Plot 3: Feature Importance for Price
+        plt.subplot(2, 2, 3)
+        for airline in self.airlines:
+            importances = pd.DataFrame({
+                'feature': self.models[airline]['features'],
+                'importance': self.models[airline]['price'].feature_importances_
+            }).sort_values('importance', ascending=True)
+            
+            plt.barh(y=importances['feature'] + f' ({airline})',
+                    width=importances['importance'],
+                    alpha=0.5,
+                    color=colors[airline])
+        plt.title('Feature Importance for Price Prediction by Airline')
+        
+        
+        # Plot 4: Feature Importance for Emissions
+        plt.subplot(2, 2, 4)
+        for airline in self.airlines:
+            importances = pd.DataFrame({
+                'feature': self.models[airline]['features'],
+                'importance': self.models[airline]['emissions'].feature_importances_
+            }).sort_values('importance', ascending=True)
+            
+            plt.barh(y=importances['feature'] + f' ({airline})',
+                    width=importances['importance'],
+                    alpha=0.5,
+                    color=colors[airline])
+        plt.title('Feature Importance for Emissions Prediction by Airline')
+           
+        plt.tight_layout()
+        plt.show()
+        
+        # Print performance metrics
+        print("\nModel Performance Metrics:")
+        for airline in self.airlines:
+            print(f"\n{airline} Airlines:")
+            airline_data = prepared_data[airline]
+            X = airline_data[self.models[airline]['features']]
+            
+            print("Price Model R2 Score:",
+                  r2_score(airline_data['ItinFare'],
+                          self.models[airline]['price'].predict(X)))
+            
+            print("Emissions Model R2 Score:",
+                  r2_score(airline_data['CO2_Emissions'],
+                          self.models[airline]['emissions'].predict(X)))
+            
+        # Print optimal results
+        print("\nOptimal Results by Airline and Scenario:")
+        for airline in self.airlines:
+            print(f"\n{airline} Airlines:")
+            for scenario, results in optimization_results[airline].items():
+                print(f"\n{scenario}:")
+                print(f"Optimal Price: ${results['optimal_price']:.2f}")
+                print(f"Predicted Emissions: {results['predicted_emissions']:.2f}")
+
+def main():
+    """
+    Main execution function that orchestrates the entire analysis pipeline:
+    1. Data processing and integration
+    2. Data cleaning
+    3. Comprehensive analysis
+    4. Time series analysis
+    5. Price-emission optimization
+    
+    Returns:
+        tuple: (cleaned_data, analysis_results, stationarity_results, 
+               prepared_data, optimization_results)
+    """
+    
+    try:
+        # Initialize data processor
+        processor = AirlineDataProcessor()
+
+        #Process different data sources
+        sustainability_data = processor.process_sustainability_reports('Sustainability Report.csv')
+        db1b_data = processor.process_db1b_data(
+            market_dir='Marketing Directory',
+            ticket_dir='Ticket Directory'
+        )
+        form41_data = processor.process_form41_data(
+            schedule_B1_dir='Schedule B1',
+            schedule_P12_dir='Schedule P 1.2'
+        )
+        t100_data = processor.process_t100_data(['t100_files/T100 2021.csv', 
+                                               't100_files/T100 2022.csv', 
+                                               't100_files/T100 2023.csv'])
+        
+        #check if all data sources were proccessed properly
+        if not any(x is None for x in [sustainability_data, db1b_data, form41_data, t100_data]):
+            
+            # Combine and clean data
+            combined_data = processor.combine_all_data(
+                sustainability_data, db1b_data, form41_data, t100_data
+            )
+            if combined_data is not None:
+                #Clean and analyze data
+                cleaner = DataCleaner(combined_data)
+                cleaned_data = cleaner.clean_data()
+                cleaned_data = cleaner.handle_missing_values()
+
+                #perform various analysis
+                analyzer = DataAnalyzer(cleaned_data)
+                analysis_results = analyzer.generate_comprehensive_report()
+
+                ts_analyzer = TimeSeriesAnalyzer(cleaned_data)
+                stationarity_results = ts_analyzer.test_stationarity()
+
+                # Run optimization analysis
+                optimizer = PriceEmissionOptimizer(cleaned_data)
+                prepared_data = optimizer.prepare_features()
+                optimizer.fit_models(prepared_data)
+                optimization_results = optimizer.optimize_price_emissions(prepared_data)
+                
+                # Visualize results
+                optimizer.visualize_results(prepared_data, optimization_results)
+                
+                return cleaned_data, analysis_results, stationarity_results, prepared_data, optimization_results
+        
+        print("Analysis cannot be performed due to missing data")
+        return None, None, None, None, None
+
+    except Exception as e:
+        print(f"Error in main execution: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        return None, None, None, None, None
+
+if __name__ == "__main__":
+    cleaned_data, analysis_results, stationarity_results, prepared_data, optimization_results = main()
