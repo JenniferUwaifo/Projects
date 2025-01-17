@@ -1,0 +1,829 @@
+#Predictive Analysis of Communicable Diseases in Ontario (2019-2023)
+
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(tidyr)
+library(pROC)
+library(nnet)
+library(glmnet)
+library(randomForest)
+library(zoo)
+library(forecast)
+
+# Load the dataset
+data <- read.csv("C:/Users/USER/OneDrive/Desktop/Communicable Disease Surveillance Data 2019-2023.csv")
+# Display the structure of the dataset
+str(data)
+head(data)
+View(data)
+
+##########################################################
+# DATA PREPARATION & CLEANING
+##########################################################
+
+# Data Cleaning
+## Remove duplicate rows
+data <- distinct(data)
+head(data)
+
+## Check and handle missing values
+# Check for missing values in the dataset
+sum(is.na(data))
+head(data)
+
+# Impute missing values for numerical columns with the median (for cases) and mode (for categorical columns)
+data <- data %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  mutate(across(where(is.character), ~ ifelse(is.na(.), names(sort(table(.), decreasing = TRUE))[1], .)))
+
+# Convert "Year" to numeric
+data$Year <- as.numeric(data$Year)
+
+# Clean and convert the data with better error handling
+clean_numeric <- function(x) {
+  # Remove any leading/trailing whitespace
+  x <- trimws(x)
+  # Replace any empty strings or "-" with NA
+  x[x == "" | x == "-"] <- NA
+  # Remove any commas from numbers
+  x <- gsub(",", "", x)
+  # Convert to numeric
+  as.numeric(x)
+}
+
+# Apply the cleaning function to all month columns
+data[, c("January", "February", "March", "April", "May", "June", "July", 
+         "August", "September", "October", "November", "December")] <- 
+  lapply(data[, c("January", "February", "March", "April", "May", "June", "July", 
+                  "August", "September", "October", "November", "December")], clean_numeric)
+
+data_cleaned <- data %>%
+  group_by(Disease.Category) %>%
+  mutate(across(January:December, 
+                ~ifelse(is.na(.), 
+                        mean(., na.rm = TRUE),  # Replace NA with category mean
+                        .))) %>%
+  ungroup()
+
+
+# Remove rows with missing disease names or disease categories
+data_cleaned <- data_cleaned %>%
+  filter(!is.na(Disease) & !is.na(Disease.Category))
+
+# Calculate Total_Monthly_Cases after converting to numeric
+data_cleaned <- data_cleaned %>%
+  mutate(Total_Monthly_Cases = rowSums(select(., January:December), na.rm = TRUE))
+
+# Convert "Disease" and "Disease.Category" to factor variables (for modeling)
+data_cleaned$Disease <- as.factor(data_cleaned$Disease)
+data_cleaned$Disease.Category <- as.factor(data_cleaned$Disease.Category)
+View(data_cleaned)
+
+##########################################################
+# Exploratory Data Analysis (EDA)
+##########################################################
+
+# 1. Table
+top_diseases_by_category <- data_cleaned %>%
+  group_by(Disease.Category) %>%
+  count(Disease, sort = TRUE) %>%
+  top_n(5, n) %>%
+  pull(Disease)
+head(top_diseases_by_category)
+
+# Filter dataset to include only the top diseases by category
+data_filtered <- data_cleaned %>%
+  filter(Disease %in% top_diseases_by_category)
+View(data_filtered)
+
+
+# 3. Bar chart of Diseases by year
+#convert the Total.Cases.for.the.Year to numeric
+data_filtered <- data_filtered %>%
+  mutate(Total.Cases.for.the.Year = as.numeric(Total.Cases.for.the.Year))
+
+# create the plot
+ggplot(data_filtered, aes(x = Year, y = Total.Cases.for.the.Year, fill = Disease.Category)) +
+  geom_area(alpha = 0.7, position = "stack") +
+  labs(title = "Yearly Trend of Total Cases by Disease Category (2019-2023)",
+       x = "Year", 
+       y = "Total Cases",
+       fill = "Disease Category") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank()
+  ) +
+  scale_x_continuous(breaks = 2019:2023) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_fill_brewer(palette = "Set2")
+
+#verify the data types after conversion
+str(data_filtered$Total.Cases.for.the.Year)
+
+
+# Create a proper month order
+month_order <- c("January", "February", "March", "April", "May", "June", 
+                 "July", "August", "September", "October", "November", "December")
+
+# 4. Monthly Trends by Category (summed across all years 2019-2023)
+monthly_by_category <- data_cleaned %>%
+  group_by(Disease.Category) %>%
+  summarise(across(all_of(month_order), sum, na.rm = TRUE)) %>%
+  pivot_longer(cols = all_of(month_order), 
+               names_to = "Month", 
+               values_to = "Cases") %>%
+  mutate(Month = factor(Month, levels = month_order))  # ensures correct month ordering
+
+ggplot(monthly_by_category, aes(x = Month, y = Cases, color = Disease.Category, group = Disease.Category)) +
+  geom_line(size = 1) +
+  geom_point() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Total Monthly Disease Cases by Category (2019-2023)",
+       subtitle = "Sum of cases for each month across all years",
+       y = "Total Number of Cases",
+       x = "Month") +
+  scale_y_continuous(labels = scales::comma)
+
+# 5. To see the trend by year and month (more detailed view)
+monthly_by_category_year <- data_cleaned %>%
+  select(Year, Disease.Category, all_of(month_order)) %>%
+  pivot_longer(cols = all_of(month_order),
+               names_to = "Month",
+               values_to = "Cases") %>%
+  mutate(Month = factor(Month, levels = month_order))
+
+ggplot(monthly_by_category_year, aes(x = Month, y = Cases, 
+                                     color = Disease.Category, 
+                                     group = interaction(Year, Disease.Category))) +
+  geom_line() +
+  facet_wrap(~Year) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Monthly Disease Cases by Category and Year",
+       y = "Number of Cases",
+       x = "Month") +
+  scale_y_continuous(labels = scales::comma)
+
+# 6. Heat Map with proper month ordering
+data_long <- data_cleaned %>%
+  select(Disease.Category, all_of(month_order)) %>%
+  group_by(Disease.Category) %>%
+  summarise(across(all_of(month_order), mean, na.rm = TRUE)) %>%
+  pivot_longer(cols = all_of(month_order),
+               names_to = "Month",
+               values_to = "Average_Cases") %>%
+  mutate(Month = factor(Month, levels = month_order))
+
+ggplot(data_long, aes(x = Month, y = Disease.Category, fill = Average_Cases)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Heat Map of Average Monthly Cases by Disease Category (2019-2023)",
+       subtitle = "Average cases for each month across all years",
+       fill = "Average Cases")
+# 7 Yearly comparism graph  
+yearly_comparison <- data_cleaned %>%
+  group_by(Year, Disease.Category) %>%
+  summarise(Total_Cases = sum(Total_Monthly_Cases, na.rm = TRUE), .groups = 'drop')
+
+ggplot(yearly_comparison, aes(x = Year, y = Total_Cases, color = Disease.Category)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "Year-over-Year Disease Cases by Category",
+       x = "Year",
+       y = "Total Cases") +
+  scale_y_continuous(labels = scales::comma)
+
+# 8 Seasonal Comparism
+# Add season column
+data_seasonal <- data_long %>%
+  mutate(Season = case_when(
+    Month %in% c("December", "January", "February") ~ "Winter",
+    Month %in% c("March", "April", "May") ~ "Spring",
+    Month %in% c("June", "July", "August") ~ "Summer",
+    TRUE ~ "Fall"
+  ))
+
+ggplot(data_seasonal, aes(x = Season, y = Average_Cases, fill = Disease.Category)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(title = "Seasonal Distribution of Disease Cases",
+       x = "Season",
+       y = "Average Cases") +
+  scale_y_continuous(labels = scales::comma)
+
+
+# 9. Top 10 diseases by total cases
+top_diseases <- data_cleaned %>%
+  group_by(Disease) %>%
+  summarise(Total_Cases = sum(Total_Monthly_Cases, na.rm = TRUE)) %>%
+  top_n(10, Total_Cases) %>%
+  arrange(desc(Total_Cases))
+
+ggplot(top_diseases, aes(x = reorder(Disease, Total_Cases), y = Total_Cases)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 10 Diseases by Total Cases",
+       x = "Disease",
+       y = "Total Cases") +
+  scale_y_continuous(labels = scales::comma)
+
+# 10.  Monthly Trends Visualization
+# Summarize monthly cases
+monthly_totals <- data_cleaned %>%
+  summarise(Jan_Total = sum(January, na.rm = TRUE),
+            Feb_Total = sum(February, na.rm = TRUE),
+            Mar_Total = sum(March, na.rm = TRUE),
+            Apr_Total = sum(April, na.rm = TRUE),
+            May_Total = sum(May, na.rm = TRUE),
+            Jun_Total = sum(June, na.rm = TRUE),
+            Jul_Total = sum(July, na.rm = TRUE),
+            Aug_Total = sum(August, na.rm = TRUE),
+            Sep_Total = sum(September, na.rm = TRUE),
+            Oct_Total = sum(October, na.rm = TRUE),
+            Nov_Total = sum(November, na.rm = TRUE),
+            Dec_Total = sum(December, na.rm = TRUE))
+
+# Convert the monthly totals to a long format for visualization
+monthly_totals_long <- gather(monthly_totals, key = "Month", value = "Total_Cases")
+
+# Plot the Monthly variation
+ggplot(monthly_totals_long, aes(x = Month, y = Total_Cases)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Monthly Variation of Communicable Diseases", 
+       x = "Month", y = "Total Cases Across All Diseases") +
+  theme_minimal()
+
+##########################################################
+# HYPERPARAMETER TUNING
+##########################################################
+
+#setting threshold
+threshold <- 100
+data_filtered <- data_cleaned %>%
+  mutate(High_Cases = ifelse(Total.Cases.for.the.Year > threshold, 1, 0))
+
+# Split data into training and test sets
+print("Number of NAs in data_filtered:")
+print(sum(is.na(data_filtered$High_Cases)))
+print(sum(is.na(data_filtered$Total.Cases.for.the.Year)))
+
+# Clean the data by removing rows with NAs
+data_filtered <- data_filtered %>%
+  filter(!is.na(High_Cases)) %>%
+  filter(!is.na(Total.Cases.for.the.Year))
+
+set.seed(123)
+trainIndex <- createDataPartition(data_filtered$High_Cases, p = 0.8, list = FALSE)
+train_data <- data_filtered[trainIndex, ]
+test_data <- data_filtered[-trainIndex, ]
+
+#Mutate disease column to categorise diseases with less than 5 cases as "Other"
+train_data <- train_data %>%
+  group_by(Disease) %>%
+  mutate(Disease_Modified = ifelse(n() < 5, "Other", as.character(Disease))) %>%
+  ungroup() %>%
+  mutate(Disease_Modified = as.factor(Disease_Modified))
+
+#Mutate disease column to categorise diseases with less than 5 cases as "Other"
+test_data <- test_data %>%
+  group_by(Disease) %>%
+  mutate(Disease_Modified = ifelse(n() < 5, "Other", as.character(Disease))) %>%
+  ungroup() %>%
+  mutate(Disease_Modified = as.factor(Disease_Modified))
+
+
+# Initial Logistic Regression
+initial_log_model <- glm(High_Cases ~ Year + Disease.Category + Disease_Modified, 
+                         data = train_data, 
+                         family = binomial)
+
+# Tune Logistic Regression threshold
+thresholds <- seq(0.3, 0.7, by = 0.05)
+threshold_results <- data.frame(
+  threshold = thresholds,
+  accuracy = numeric(length(thresholds)),
+  sensitivity = numeric(length(thresholds)),
+  specificity = numeric(length(thresholds))
+)
+
+# Test each threshold
+for(i in seq_along(thresholds)) {
+  predictions <- ifelse(predict(initial_log_model, test_data, type = "response") > thresholds[i], 1, 0)
+  cm <- confusionMatrix(factor(predictions), factor(test_data$High_Cases))
+  threshold_results$accuracy[i] <- cm$overall["Accuracy"]
+  threshold_results$sensitivity[i] <- cm$byClass["Sensitivity"]
+  threshold_results$specificity[i] <- cm$byClass["Specificity"]
+}
+
+# Visualize threshold tuning results
+threshold_results_long <- pivot_longer(threshold_results, 
+                                       cols = c("accuracy", "sensitivity", "specificity"),
+                                       names_to = "metric",
+                                       values_to = "value")
+
+# Create the plot
+ggplot(threshold_results_long, aes(x = threshold, y = value, color = metric)) +
+  geom_line() +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "Logistic Regression Threshold Tuning",
+       x = "Classification Threshold",
+       y = "Metric Value",
+       color = "Metric") +
+  scale_color_brewer(palette = "Set1")
+
+# Find optimal threshold
+optimal_threshold <- threshold_results %>%
+  mutate(f1 = 2 * (sensitivity * specificity)/(sensitivity + specificity)) %>%
+  arrange(desc(f1)) %>%
+  slice(1)
+
+print("Optimal threshold:")
+print(optimal_threshold)
+
+
+# Random Forest Tuning
+# Set up cross-validation
+control <- trainControl(
+  method = "cv",          
+  number = 5,             
+  search = "grid",        
+  classProbs = TRUE,      
+  summaryFunction = twoClassSummary  
+)
+
+# Define tuning grid
+rf_grid <- expand.grid(mtry = c(2, 3, 4))
+
+# Tune Random Forest
+rf_tuned <- train(
+  High_Cases ~ Year + Disease.Category + Disease_Modified,
+  data = train_rf_clean,
+  method = "rf",
+  metric = "ROC",
+  trControl = control,
+  tuneGrid = rf_grid,
+  importance = TRUE
+)
+
+##########################################################
+# MODEL DEVELOPMENT WITH TUNED PARAMETERS
+##########################################################
+# Final Logistic Regression with optimal threshold
+final_lr_model <- glm(High_Cases ~ Year + Disease.Category + Disease_Modified, 
+                      data = train_data, 
+                      family = binomial)
+
+# Make predictions with optimal threshold
+lr_predictions <- predict(final_lr_model, test_data, type = "response")
+lr_predicted_classes <- ifelse(lr_predictions > optimal_threshold$threshold, 1, 0)
+
+# Final Random Forest with tuned parameters
+final_rf_model <- rf_tuned
+rf_predictions <- predict(final_rf_model, test_rf_clean)
+rf_probs <- predict(final_rf_model, test_rf_clean, type = "prob")
+
+##########################################################
+# MODEL COMPARISON
+##########################################################
+# Create confusion matrices
+lr_cm <- confusionMatrix(factor(lr_predicted_classes), factor(test_data$High_Cases))
+rf_cm <- confusionMatrix(rf_predictions, test_rf_clean$High_Cases)
+
+# Create ROC curves
+lr_roc <- roc(test_data$High_Cases, lr_predictions)
+rf_roc <- roc(as.numeric(test_rf_clean$High_Cases == "High"), rf_probs[,"High"])
+
+# Compare models
+comparison_df <- data.frame(
+  Model = c("Tuned Logistic Regression", "Tuned Random Forest"),
+  Accuracy = c(lr_cm$overall["Accuracy"], rf_cm$overall["Accuracy"]),
+  Sensitivity = c(lr_cm$byClass["Sensitivity"], rf_cm$byClass["Sensitivity"]),
+  Specificity = c(lr_cm$byClass["Specificity"], rf_cm$byClass["Specificity"]),
+  Precision = c(lr_cm$byClass["Precision"], rf_cm$byClass["Precision"]),
+  AUC = c(auc(lr_roc), auc(rf_roc))
+)
+
+print(comparison_df)
+
+# Plot ROC comparison
+plot(lr_roc, col = "blue", lwd = 2, main = "ROC Curve Comparison (Tuned Models)")
+lines(rf_roc, col = "red", lwd = 2)
+legend("bottomright", 
+       legend = c("Tuned Logistic Regression", "Tuned Random Forest"),
+       col = c("blue", "red"), 
+       lwd = 2)
+
+##########################################################
+# FINAL MODEL RESULTS (Selected Model: Logistic Regression)
+##########################################################
+# Summary of final model
+summary(final_lr_model)
+
+# Final confusion matrix visualization
+final_cm <- confusionMatrix(factor(lr_predicted_classes), factor(test_data$High_Cases))
+cm_table <- as.data.frame(as.table(final_cm$table))
+names(cm_table) <- c("Predicted", "Actual", "Freq")
+
+# Visualize final confusion matrix
+ggplot(cm_table, aes(Predicted, Actual, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "red", size = 5) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Final Model Confusion Matrix", 
+       x = "Predicted", 
+       y = "Actual") +
+  theme_minimal()
+
+# Predictions for 2024
+print("Number of unique disease categories:")
+print(length(unique(data_cleaned$Disease.Category)))
+
+print("\nNumber of unique modified diseases:")
+print(length(unique(data_cleaned$Disease_Modified)))
+
+# Create future prediction data frame correctly
+future_dates <- data.frame(
+  Year = 2024,
+  Disease.Category = unique(data_cleaned$Disease.Category)
+) %>%
+  # Add Disease_Modified the same way we did in training
+  mutate(Disease_Modified = "Other")  # Default to "Other" as we're predicting by category
+
+# Verify the structure
+print("\nStructure of prediction frame:")
+str(future_dates)
+
+# Convert to factors to match training data
+future_dates$Disease.Category <- factor(future_dates$Disease.Category, 
+                                        levels = levels(data_cleaned$Disease.Category))
+future_dates$Disease_Modified <- factor(future_dates$Disease_Modified)
+
+# Make predictions
+future_predictions <- predict(final_lr_model, newdata = future_dates, type = "response")
+
+# Create results dataframe
+prediction_results <- data.frame(
+  Disease.Category = future_dates$Disease.Category,
+  Predicted_Probability = future_predictions,
+  High_Risk = ifelse(future_predictions > optimal_threshold$threshold, "Yes", "No")
+) %>%
+  arrange(desc(Predicted_Probability))
+
+# View predictions
+print("\nPredictions for 2024:")
+print(prediction_results)
+
+##########################################################
+# TIME SERIES FORECASTING FOR 2024 WITH SARIMA
+##########################################################
+# Function to create time series forecasts for each disease category
+forecast_diseases_2024 <- function(data_cleaned) {
+  # Get unique disease categories
+  categories <- unique(data_cleaned$Disease.Category)
+  
+  # Create empty list to store forecasts
+  forecasts <- list()
+  
+  for(category in categories) {
+    # Filter data for current category
+    category_data <- data_cleaned %>%
+      filter(Disease.Category == category) %>%
+      arrange(Year)
+    
+    # Skip if we don't have enough data points
+    if(nrow(category_data) < 3) {
+      warning(paste("Not enough data points for category:", category))
+      next
+    }
+    
+    tryCatch({
+      # Create monthly time series
+      monthly_data <- category_data %>%
+        select(January:December) %>%
+        unlist() %>%
+        ts(frequency = 12, start = c(2019, 1))
+      
+      # Create yearly time series for total cases
+      yearly_data <- category_data %>%
+        select(Total.Cases.for.the.Year) %>%
+        unlist() %>%
+        ts(start = 2019)
+      
+      if(length(monthly_data) > 0 && length(yearly_data) > 0) {
+        # Fit SARIMA model for monthly predictions
+        monthly_fit <- auto.arima(monthly_data, seasonal = TRUE)
+        monthly_forecast <- forecast(monthly_fit, h = 12)
+        
+        # Fit model for yearly totals
+        yearly_fit <- auto.arima(yearly_data)
+        yearly_forecast <- forecast(yearly_fit, h = 1)
+        
+        # Store results
+        forecasts[[category]] <- list(
+          category = category,
+          yearly_forecast = yearly_forecast,
+          monthly_forecast = monthly_forecast,
+          confidence_80 = c(yearly_forecast$lower[1,1], yearly_forecast$upper[1,1]),
+          confidence_95 = c(yearly_forecast$lower[1,2], yearly_forecast$upper[1,2])
+        )
+      }
+    }, error = function(e) {
+      warning(paste("Could not forecast for category:", category))
+    })
+  }
+  
+  return(forecasts)
+}
+
+# Generate forecasts
+disease_forecasts <- forecast_diseases_2024(data_cleaned)
+
+# Create summary dataframe of forecasts
+forecast_summary <- do.call(rbind, lapply(disease_forecasts[!sapply(disease_forecasts, is.null)], function(x) {
+  data.frame(
+    Category = x$category,
+    Forecast_2024 = round(x$yearly_forecast$mean[1], 2),
+    Lower_95 = round(x$confidence_95[1], 2),
+    Upper_95 = round(x$confidence_95[2], 2),
+    row.names = NULL
+  )
+}))
+
+# Print summary
+print("Forecasts for 2024:")
+print(forecast_summary %>% arrange(desc(Forecast_2024)))
+
+# Create visualization
+ggplot(forecast_summary, aes(x = reorder(Category, Forecast_2024), y = Forecast_2024)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = Lower_95, ymax = Upper_95), width = 0.2) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Predicted Disease Cases for 2024 by Category",
+       subtitle = "With 95% confidence intervals",
+       x = "Disease Category",
+       y = "Predicted Cases") +
+  theme(axis.text.y = element_text(size = 8))
+
+######################################################
+
+
+# First, let's examine what we're working with
+str(data_cleaned)
+
+# Let's add some debugging and data preparation
+forecast_diseases_2024 <- function(data) {
+  # Get unique disease categories
+  categories <- unique(data$Disease.Category)
+  
+  # Create empty list to store forecasts
+  forecasts <- list()
+  
+  for(category in categories) {
+    # Print category for debugging
+    cat("Processing category:", category, "\n")
+    
+    # Filter data for current category
+    category_data <- data %>%
+      filter(Disease.Category == category) %>%
+      arrange(Year) %>%
+      # Convert any character numbers to numeric
+      mutate(across(c(January:December), ~as.numeric(as.character(.)))) %>%
+      mutate(Total.Cases.for.the.Year = as.numeric(as.character(Total.Cases.for.the.Year)))
+    
+    # Print summary for debugging
+    cat("Number of rows:", nrow(category_data), "\n")
+    cat("Sample of Total Cases:", head(category_data$Total.Cases.for.the.Year), "\n")
+    
+    # Skip if we don't have enough data points
+    if(nrow(category_data) < 3) {
+      warning(paste("Not enough data points for category:", category))
+      next
+    }
+    
+    tryCatch({
+      # Check for any non-numeric or NA values
+      monthly_cols <- category_data %>% select(January:December)
+      if(any(sapply(monthly_cols, function(x) !is.numeric(x) || any(is.na(x))))) {
+        cat("Non-numeric or NA values found in monthly data\n")
+        next
+      }
+      
+      # Create monthly time series
+      monthly_data <- category_data %>%
+        select(January:December) %>%
+        unlist() %>%
+        ts(frequency = 12, start = c(2019, 1))
+      
+      # Create yearly time series for total cases
+      yearly_data <- category_data %>%
+        select(Total.Cases.for.the.Year) %>%
+        unlist() %>%
+        ts(start = 2019)
+      
+      if(length(monthly_data) > 0 && length(yearly_data) > 0) {
+        # Fit SARIMA model for monthly predictions
+        monthly_fit <- auto.arima(monthly_data, seasonal = TRUE, 
+                                  D = 0, # Force no seasonal differences due to short time series
+                                  max.p = 2, max.q = 2, # Limit model complexity
+                                  stepwise = FALSE)
+        monthly_forecast <- forecast(monthly_fit, h = 12)
+        
+        # Fit model for yearly totals
+        yearly_fit <- auto.arima(yearly_data, 
+                                 max.p = 2, max.q = 2,
+                                 stepwise = FALSE)
+        yearly_forecast <- forecast(yearly_fit, h = 1)
+        
+        # Store results
+        forecasts[[category]] <- list(
+          category = category,
+          yearly_forecast = yearly_forecast,
+          monthly_forecast = monthly_forecast,
+          confidence_80 = c(yearly_forecast$lower[1,1], yearly_forecast$upper[1,1]),
+          confidence_95 = c(yearly_forecast$lower[1,2], yearly_forecast$upper[1,2])
+        )
+        
+        cat("Successfully created forecast for:", category, "\n")
+      }
+    }, error = function(e) {
+      cat("Error in category:", category, "\nError message:", e$message, "\n")
+    })
+  }
+  
+  return(forecasts)
+}
+
+# Generate forecasts with the updated function
+disease_forecasts <- forecast_diseases_2024(data_cleaned)
+
+# Check which categories were successfully forecasted
+successful_forecasts <- names(disease_forecasts)[!sapply(disease_forecasts, is.null)]
+cat("Successfully forecasted categories:", length(successful_forecasts), "\n")
+print(successful_forecasts)
+
+# Create summary dataframe only for successful forecasts
+if(length(successful_forecasts) > 0) {
+  forecast_summary <- do.call(rbind, lapply(disease_forecasts[successful_forecasts], function(x) {
+    data.frame(
+      Category = x$category,
+      Forecast_2024 = round(x$yearly_forecast$mean[1], 2),
+      Lower_95 = round(x$confidence_95[1], 2),
+      Upper_95 = round(x$confidence_95[2], 2),
+      row.names = NULL
+    )
+  }))
+  
+  # Print summary
+  print("Forecasts for 2024:")
+  print(forecast_summary %>% arrange(desc(Forecast_2024)))
+} else {
+  print("No successful forecasts were generated.")
+}
+
+
+#######################################################################################
+forecast_diseases_2024 <- function(data) {
+  categories <- unique(data$Disease.Category)
+  forecasts <- list()
+  
+  for(category in categories) {
+    cat("Processing category:", category, "\n")
+    
+    # Filter and prepare data
+    category_data <- data %>%
+      filter(Disease.Category == category) %>%
+      arrange(Year) %>%
+      # Convert to numeric and replace any NAs with 0
+      mutate(across(c(January:December), ~as.numeric(as.character(.)))) %>%
+      mutate(Total.Cases.for.the.Year = as.numeric(as.character(Total.Cases.for.the.Year))) %>%
+      mutate(across(c(January:December, Total.Cases.for.the.Year), ~replace_na(., 0)))
+    
+    cat("Number of rows:", nrow(category_data), "\n")
+    cat("Sample of Total Cases:", head(category_data$Total.Cases.for.the.Year), "\n")
+    
+    if(nrow(category_data) < 3) {
+      warning(paste("Not enough data points for category:", category))
+      next
+    }
+    
+      # Create monthly time series
+      monthly_data <- category_data %>%
+        select(January:December) %>%
+        unlist() %>%
+        ts(frequency = 12, start = c(2019, 1))
+      
+      # Create yearly time series for total cases
+      yearly_data <- category_data %>%
+        select(Total.Cases.for.the.Year) %>%
+        unlist() %>%
+        ts(start = 2019)
+      
+      if(length(monthly_data) > 0 && length(yearly_data) > 0) {
+        # Use simpler models for short time series
+        monthly_fit <- auto.arima(monthly_data, 
+                                  seasonal = TRUE,
+                                  D = 0,  # No seasonal differencing
+                                  max.p = 1, max.q = 1,  # Limit model complexity
+                                  max.P = 1, max.Q = 1,  # Limit seasonal components
+                                  stepwise = TRUE)
+        
+        monthly_forecast <- forecast(monthly_fit, h = 12)
+        
+        # Use simple exponential smoothing for yearly totals
+        yearly_fit <- ets(yearly_data, model="ANN")  # Simple exponential smoothing
+        yearly_forecast <- forecast(yearly_fit, h = 1)
+        
+        # Ensure predictions are non-negative
+        yearly_mean <- max(0, yearly_forecast$mean[1])
+        yearly_lower <- max(0, yearly_forecast$lower[1,2])
+        yearly_upper <- max(yearly_mean * 1.5, yearly_forecast$upper[1,2])
+        
+        forecasts[[category]] <- list(
+          category = category,
+          yearly_forecast = yearly_forecast,
+          monthly_forecast = monthly_forecast,
+          confidence_80 = c(max(0, yearly_forecast$lower[1,1]), 
+                            max(yearly_mean * 1.2, yearly_forecast$upper[1,1])),
+          confidence_95 = c(yearly_lower, yearly_upper)
+        )
+        
+        cat("Successfully created forecast for:", category, "\n")
+      }
+
+  }
+  
+  return(forecasts)
+}
+
+# Generate forecasts
+disease_forecasts <- forecast_diseases_2024(data_cleaned)
+
+####################################################
+# Create summary dataframe 
+forecast_summary <- do.call(rbind, lapply(disease_forecasts[!sapply(disease_forecasts, is.null)], function(x) {
+  data.frame(
+    Category = x$category,
+    Forecast_2024 = round(x$yearly_forecast$mean[1], 0),  # Round to whole numbers
+    Lower_95 = round(x$confidence_95[1], 0),
+    Upper_95 = round(x$confidence_95[2], 0),
+    row.names = NULL
+  )
+}))
+
+# Print summary
+print("Forecasts for 2024:")
+forecast_summary %>% 
+  arrange(desc(Forecast_2024)) %>%
+  mutate(
+    Forecast_Range = sprintf("%d - %d", Lower_95, Upper_95),
+    Forecast_2024 = format(Forecast_2024, big.mark=",", na.encode=FALSE)
+  ) %>%
+  select(Category, Forecast_2024, Forecast_Range) %>%
+  as.data.frame() %>%
+  print(row.names = FALSE)
+
+# Also create a visualization
+ggplot(forecast_summary, aes(x = reorder(Category, Forecast_2024), y = Forecast_2024)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = Lower_95, ymax = Upper_95), width = 0.2) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Predicted Disease Cases for 2024 by Category",
+       subtitle = "With 95% confidence intervals",
+       x = "Disease Category",
+       y = "Predicted Cases") +
+  theme(axis.text = element_text(size = 10))
+
+# Create bar chart
+ggplot(forecast_summary, aes(x = reorder(Category, Forecast_2024), y = Forecast_2024)) +
+  geom_bar(stat = "identity", fill = "blue", alpha = 0.7) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Predicted Disease Cases for 2024 by Category",
+       subtitle = "With 95% confidence intervals",
+       x = "Disease Category",
+       y = "Predicted Cases") +
+  theme(
+    axis.text = element_text(size = 7),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(size = 12),
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11)
+  ) +
+  scale_y_continuous(labels = scales::comma)
